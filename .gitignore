@@ -1,0 +1,28 @@
+# Auto-generated pipeline data
+.tmp/
+output/
+
+# Secrets — never commit
+.env
+.env.local
+credentials.json
+token.json
+
+# Claude Code config (local dev tool — not part of project)
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Node
+node_modules/
+.next/
+npm-debug.log*
+*.tsbuildinfo
+
+# macOS
+.DS_Store

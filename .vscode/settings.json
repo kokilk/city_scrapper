@@ -1,0 +1,9 @@
+{
+  "explorer.sortOrder": "foldersNestsFiles",
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.patterns": {
+    "README.md": ".env.example, .gitignore, requirements.txt",
+    "leadership_fast.py": "leadership_run.py, batch_run.py, run.py",
+    "*.json": "$(capture).json"
+  }
+}
