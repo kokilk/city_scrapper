@@ -287,16 +287,22 @@ def _resolve_llc_to_company(llc_name: str, address: str, city: str, state: str) 
     if len(base) < 3:
         base = llc_name  # couldn't simplify
 
-    # Search for the operating company
+    # Search for the operating company — try both quoted and unquoted to handle truncated names
     snippets = []
-    for q in [
+    queries = [
         f'"{base}" real estate {city} company developer investor',
         f'"{llc_name}" {address} {city} owner developer operator',
-    ]:
+        # Unquoted fallback handles truncated DOB names
+        f'{base} real estate {city} company developer',
+        f'{address} {city} building owner developer company',
+    ]
+    for q in queries:
         r = search_web(q, 5)
         for item in r.get("results", []):
             if not _is_skip_domain(item.get("url", "")):
                 snippets.append(item.get("snippet", "")[:300])
+        if snippets:
+            break  # stop once we have content
 
     if not snippets:
         return base
@@ -347,9 +353,20 @@ def find_building_owner(address: str, city: str, state: str, zip_code: str = "")
     raw = _dob_lookup(address, city)
     if raw:
         operating = _resolve_llc_to_company(raw, address, city, state)
+        # DOB truncates names at ~30 chars — if the resolved name looks unchanged/short,
+        # fall back to an address-based web search to get the real company name
+        looks_truncated = (
+            operating.upper() == raw.upper()
+            and len(operating) < 15
+            and not re.search(r"\b(LLC|INC|CORP|GROUP|REALTY|CAPITAL|PARTNERS)\b", operating, re.I)
+        )
+        if looks_truncated:
+            web = _web_owner_lookup(address, city, state)
+            if web:
+                operating = web
         return raw, operating
 
-    # 3. Exa web search fallback
+    # 3. Web search fallback
     raw = _web_owner_lookup(address, city, state)
     return raw, raw
 

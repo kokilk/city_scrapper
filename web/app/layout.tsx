@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "City Scraper — Real Estate Intelligence",
-  description: "Find every stakeholder behind any property address.",
+  description: "Find leadership and key contacts for any property address.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

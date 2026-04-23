@@ -154,39 +154,86 @@ def lookup_owner_company(address: str, city: str) -> dict:
     }
 
 
+def _google_search(query: str, num_results: int = 5) -> dict:
+    """Google Custom Search fallback when Exa is unavailable."""
+    api_key = os.getenv("GOOGLE_CSE_API_KEY", "")
+    cse_id = os.getenv("GOOGLE_CSE_ID", "")
+    if not api_key or not cse_id:
+        return {"results": [], "error": "Google CSE keys not set"}
+    params = urllib.parse.urlencode({
+        "key": api_key,
+        "cx": cse_id,
+        "q": query,
+        "num": min(num_results, 10),
+    })
+    data = _get(f"https://www.googleapis.com/customsearch/v1?{params}")
+    if isinstance(data, dict) and "error" in data:
+        return {"results": [], "error": str(data["error"])}
+    results = []
+    for item in data.get("items", []):
+        results.append({
+            "url": item.get("link", ""),
+            "title": item.get("title", ""),
+            "snippet": item.get("snippet", ""),
+        })
+    return {"results": results, "query": query}
+
+
+def _ddg_search(query: str, num_results: int = 5) -> dict:
+    """DuckDuckGo search via ddgs package — no API key required, last-resort fallback."""
+    try:
+        from ddgs import DDGS
+        raw = list(DDGS().text(query, max_results=num_results))
+        results = [
+            {
+                "url": r.get("href", ""),
+                "title": r.get("title", ""),
+                "snippet": r.get("body", ""),
+            }
+            for r in raw
+        ]
+        return {"results": results, "query": query}
+    except Exception as e:
+        return {"results": [], "error": str(e)}
+
+
 def search_web(query: str, num_results: int = 5, text_chars: int = 600) -> dict:
     """
-    Search the web using Exa.ai.
+    Search the web using Exa.ai (primary) or Google CSE (fallback).
     Use for: company website, LinkedIn company page, leadership team mentions,
     news articles naming executives, press releases.
     text_chars: max characters per result snippet (default 600, use 1200+ for
     leadership enrichment where longer snippets capture more names).
     """
-    api_key = os.getenv("EXA_API_KEY", "")
-    if not api_key:
-        return {"results": [], "error": "EXA_API_KEY not set"}
+    exa_key = os.getenv("EXA_API_KEY", "")
+    if exa_key:
+        payload = {
+            "query": query,
+            "numResults": min(num_results, 10),
+            "useAutoprompt": True,
+            "type": "neural",
+            "contents": {"text": {"maxCharacters": text_chars}},
+        }
+        headers = {"x-api-key": exa_key}
+        data = _post("https://api.exa.ai/search", headers, payload)
+        if "error" not in data:
+            results = []
+            for r in data.get("results", []):
+                results.append({
+                    "url": r.get("url", ""),
+                    "title": r.get("title", ""),
+                    "snippet": (r.get("text") or r.get("snippet") or "")[:text_chars],
+                })
+            if results:
+                return {"results": results, "query": query}
 
-    payload = {
-        "query": query,
-        "numResults": min(num_results, 10),
-        "useAutoprompt": True,
-        "type": "neural",
-        "contents": {"text": {"maxCharacters": text_chars}},
-    }
-    headers = {"x-api-key": api_key}
-    data = _post("https://api.exa.ai/search", headers, payload)
+    # Fallback to Google CSE
+    google = _google_search(query, num_results)
+    if google.get("results"):
+        return google
 
-    if "error" in data:
-        return {"results": [], "error": data["error"]}
-
-    results = []
-    for r in data.get("results", []):
-        results.append({
-            "url": r.get("url", ""),
-            "title": r.get("title", ""),
-            "snippet": (r.get("text") or r.get("snippet") or "")[:text_chars],
-        })
-    return {"results": results, "query": query}
+    # Last resort: DuckDuckGo (no API key needed)
+    return _ddg_search(query, num_results)
 
 
 def fetch_webpage(url: str) -> dict:

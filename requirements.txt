@@ -1,3 +1,4 @@
 anthropic>=0.25
 python-dotenv>=1.0
 rapidfuzz>=3.6
+ddgs>=7.0.0
