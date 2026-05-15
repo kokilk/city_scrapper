@@ -1,228 +1,200 @@
-# City Scraper — NYC Real Estate Intelligence
+# City Scrapper — Real Estate Intelligence Tool
 
-A two-model intelligence system that takes a building address and automatically finds every key person connected to that property — owners, executives, developers, architects, contractors, lenders — along with verified contact details.
-
----
-
-## What This Does
-
-You give it an address. It gives you people and contacts.
-
-**Input:** `28-07 Jackson Avenue, Long Island City, NY`
-
-**Output:** Rob Speyer (CEO, Tishman Speyer) · Dan Shannon (Managing Partner, MdeAS Architects) · Matthew Schimenti (President, Schimenti Construction) · Bank of America (Lender, $425M) — all with emails, phones, LinkedIn
+Give it an address. Get back the company that owns the building, their top executives, and verified contact details (email, phone, LinkedIn).
 
 ---
 
-## Two Models
+## What It Does
 
-This project has two distinct pipelines built for different use cases:
+**Input:** Any US property address
 
-| | Model 1 — Stakeholder Pipeline | Model 2 — Leadership Pipeline |
-|---|---|---|
-| **What it finds** | All roles: Owner, Developer, Architect, GC, Lender, Leasing Agent | Top executives at the building's owner company |
-| **Depth** | Deep — multiple sources cross-verified | Fast — single-pass agent |
-| **Speed** | 2–5 minutes per address | 15–40 seconds per address |
-| **Output** | CSV + Google Sheet (15 columns) | CSV + JSON (10 columns) |
-| **Entry point** | `python3 execution/pipeline_runner.py` | `python3 leadership_fast.py` |
-| **Confidence scoring** | Yes (0–100 with labels) | Yes (High / Medium / Low) |
+**Output:** Owner company → top 10–15 executives → verified emails, phones, LinkedIn profiles
 
-Full details: [Model 1 docs](model/MODEL1_STAKEHOLDER_PIPELINE.md) · [Model 2 docs](model/MODEL2_LEADERSHIP_PIPELINE.md)
+**Example:**
+```
+Address: 432 Park Avenue, New York, NY
+Owner:   CIM Group
+People:  Shaul Kuba (Co-Founder) · Richard Ressler (Co-Founder) · ...
+         with emails, phones, and LinkedIn URLs
+```
+
+---
+
+## How the Pipeline Works
+
+```
+Address
+  │
+  ├─► Regrid          — Nationwide parcel ownership lookup (who owns the building)
+  │   └─► NYC PLUTO / ACRIS — Free fallback for NYC addresses (auto, no key needed)
+  │
+  ├─► LLC Resolution  — If owner is a holding LLC, resolves to the real operating company
+  │
+  ├─► Company Validation — Confirms company from 2 independent web sources
+  │
+  ├─► Exa Web Search  — Finds company website + leadership pages
+  │
+  ├─► Claude (AI)     — Extracts names and titles from scraped content
+  │
+  ├─► Apollo.io       — Enriches each person: email + phone + LinkedIn (paid plan required)
+  │   └─► Hunter.io   — Email fallback if Apollo doesn't return one
+  │
+  ├─► Person Validation — Verifies each person is real and at that company
+  │
+  └─► Email Validation  — Checks email deliverability
+```
+
+---
+
+## APIs & Keys
+
+Only two keys are required to get full results. The rest are fallbacks or optional.
+
+| API | Purpose | Required? | Notes |
+|-----|---------|-----------|-------|
+| **Anthropic** | AI extraction + reasoning | ✅ Yes | Powers all Claude calls |
+| **Regrid** | Nationwide parcel ownership | ✅ Yes | Primary property lookup |
+| **Exa.ai** | Web search for company + leadership | ✅ Yes | Neural search |
+| **Apollo.io** | Email + phone + LinkedIn enrichment | ⚠️ Paid plan | Needs Scale plan or API add-on for programmatic access |
+| **Hunter.io** | Email discovery fallback | ✅ Active | Free tier: 50/mo |
+| **Apify** | LinkedIn profile scraping | Optional | Fallback for LinkedIn |
+| **Google Sheets** | Live output destination (batch mode) | Optional | Needs service account JSON |
+| **NYC PLUTO/ACRIS** | Free NYC property data | Auto | No key — used automatically for NYC |
+
+---
+
+## Features
+
+### Single Address Search
+- Enter one address in the web UI
+- Pipeline runs in ~30–60 seconds
+- Returns owner company + leadership list with contacts
+
+### Batch Upload (Excel)
+- Upload an `.xlsx` file with up to 100+ addresses (one address per row)
+- Processed in waves of 10 addresses in parallel
+- **Live progress bar** updates in real time per address
+- Each address shows status: `searching → found N` or `failed`
+- Results pushed live to **Google Sheets** as each address completes
+- One automatic retry per failed address before marking it as failed
+
+### Validation
+- **Company validation** — confirms owner from 2 independent sources, confidence scored High / Medium / Low
+- **Person validation** — verifies each executive is real and currently at the company
+- **Email validation** — checks deliverability before showing the email
 
 ---
 
 ## Project Structure
 
 ```
-city_scraper/
+city_scrapper/
 │
-├── README.md                        ← You are here
-├── .env.example                     ← API key template (copy to .env)
-├── requirements.txt                 ← Python dependencies
+├── .env                    ← API keys (never commit this)
+├── requirements.txt        ← Python dependencies
 │
-├── model/                           ← All documentation
-│   ├── MODEL1_STAKEHOLDER_PIPELINE.md   ← Deep dive on Model 1
-│   ├── MODEL2_LEADERSHIP_PIPELINE.md    ← Deep dive on Model 2
-│   ├── PLAN.md                          ← Original design plan
-│   └── directives/                      ← 11 SOPs for Model 1 stages
-│       ├── 01_stakeholder_pipeline_overview.md
-│       ├── 02_address_normalization.md
-│       ├── 03_data_sources_and_api_keys.md
-│       └── ... (11 total)
+├── leadership/             ← Core pipeline
+│   ├── pipeline.py         ← Main pipeline logic (all 4 steps)
+│   ├── tools.py            ← All API integrations (Regrid, Apollo, Exa, Hunter, etc.)
+│   ├── sheets.py           ← Google Sheets live push
+│   ├── validation.py       ← Company, person, and email validation
+│   ├── agent.py            ← Claude agent wrapper
+│   └── prompts.py          ← LLM prompt templates
 │
-├── execution/                       ← Model 1: Full stakeholder pipeline
-│   ├── pipeline_runner.py           ← Entry point — run this
-│   ├── models.py                    ← Shared dataclasses
-│   ├── api_client.py                ← Async HTTP with retry + rate limiting
-│   ├── normalize_address.py         ← Smarty address verification
-│   ├── pluto_lookup.py              ← NYC PLUTO owner lookup (free)
-│   ├── permit_scraper.py            ← NYC DOB permit scraping (free)
-│   ├── shovels_permit_fetch.py      ← Shovels permit data
-│   ├── shovels_contractor_fetch.py  ← Shovels contractor profiles
-│   ├── attom_property_fetch.py      ← ATTOM owner + lender data
-│   ├── opencorporates_entity_lookup.py ← LLC → human officer resolution
-│   ├── county_assessor_router.py    ← County FIPS routing
-│   ├── county_assessor_fetch.py     ← County assessor records
-│   ├── entity_extractor.py          ← Role classification
-│   ├── contact_enricher.py          ← Apollo + Hunter enrichment
-│   ├── cross_verifier.py            ← Multi-source verification
-│   ├── confidence_scorer.py         ← 0–100 scoring engine
-│   ├── deduplicator.py              ← Merge duplicate records
-│   └── sheets_writer.py             ← Google Sheets output
+├── api/
+│   └── server.py           ← FastAPI backend (port 8000)
+│                             Endpoints: /run/leadership, /batch/upload, /batch/status/{id}
 │
-├── leadership/                      ← Model 2: Fast leadership pipeline
-│   ├── pipeline.py                  ← Core pipeline logic
-│   ├── tools.py                     ← search_web, fetch_webpage, find_email, find_linkedin_url
-│   ├── agent.py                     ← Claude Haiku agent wrapper
-│   ├── prompts.py                   ← LLM prompt templates
-│   └── __init__.py
+├── web/                    ← Next.js frontend (port 3000)
+│   └── app/
+│       └── page.tsx        ← Main UI (single search + batch upload tabs)
 │
-├── agent/                           ← Original prototype agent (v0)
-│   ├── agent.py                     ← Claude Sonnet agentic loop
-│   ├── tools.py                     ← Early tool set
-│   └── prompts.py
+├── config/
+│   ├── apis.py             ← Centralised API key loader
+│   └── api_keys.env.example
 │
-├── api/                             ← REST API server (Railway)
-│   ├── server.py
-│   ├── requirements.txt
-│   ├── Procfile
-│   └── railway.json
-│
-├── web/                             ← Next.js web frontend
-│   ├── app/
-│   ├── components/
-│   └── ...
-│
-├── leadership_fast.py               ← Model 2 CLI entry point
-├── leadership_run.py                ← Model 2 batch runner
-├── batch_run.py                     ← Multi-address batch processor
-├── run.py                           ← Prototype agent CLI entry point
-│
-├── input/                           ← Address lists to process
-│   ├── addresses.csv
-│   ├── addresses_astoria.csv
-│   └── addresses_remaining.csv
-│
-└── output/                          ← All output (gitignored)
-    ├── LIC_all_stakeholders_FINAL.csv
-    └── leadership/                  ← Per-address CSV + JSON
+└── output/                 ← Generated CSVs and JSONs (gitignored)
+    └── leadership/
 ```
-
----
-
-## APIs Used
-
-### Model 1 — Stakeholder Pipeline
-
-| API | Purpose | Cost |
-|-----|---------|------|
-| **Smarty Streets** | Address normalization + validation | Free: 250/mo |
-| **NYC PLUTO** | Building owner lookup from city database | Free (no key) |
-| **NYC DOB** | Permit history and contractor records | Free (no key) |
-| **Shovels.ai** | Primary permit + contractor data source | Paid: $599/mo |
-| **ATTOM Data** | Property ownership + lender + deed records | Paid: ~$95/mo |
-| **OpenCorporates** | Resolve LLCs → named human officers | Free: 200/mo |
-| **Apollo.io** | Email + phone + LinkedIn enrichment | Free: 100 credits/mo |
-| **Hunter.io** | Email discovery fallback | Free: 50 searches/mo |
-| **Google Sheets API** | Output destination | Free |
-
-### Model 2 — Leadership Pipeline
-
-| API | Purpose | Cost |
-|-----|---------|------|
-| **NYC PLUTO** | Building owner lookup | Free (no key) |
-| **Exa.ai** | Neural web search (find company + team pages) | Paid per search |
-| **Anthropic Claude Haiku** | Extract + reason over scraped data | Per token |
-| **Hunter.io** | Email discovery | Free: 50 searches/mo |
-| **Apify** | Deep LinkedIn profile scraping | Per run |
 
 ---
 
 ## Quick Start
 
-### Model 2 — Leadership Pipeline (recommended for getting started)
-
 ```bash
-# 1. Clone and install
-git clone https://github.com/YOUR_USERNAME/city_scrapper
+# 1. Clone and set up
+git clone https://github.com/kokilk/city_scrapper.git
 cd city_scrapper
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Add keys to .env
-cp .env.example .env
-# Fill in: EXA_API_KEY, ANTHROPIC_API_KEY, HUNTER_API_KEY
+# 2. Add your API keys
+cp config/api_keys.env.example .env
+# Edit .env — minimum required: ANTHROPIC_API_KEY, REGRID_API_KEY, EXA_API_KEY
 
-# 3. Run a single address
-python3 leadership_fast.py "28-07 Jackson Avenue, Long Island City, NY"
+# 3. Start the backend
+uvicorn api.server:app --reload --port 8000
 
-# 4. Append more addresses to the same output file
-python3 leadership_fast.py "30-30 47th Avenue, Long Island City, NY" --append
-```
-
-Output saved to `output/leadership/leadership_latest.csv`
-
-### Model 1 — Full Stakeholder Pipeline
-
-```bash
-# Requires more API keys — see docs/MODEL1_STAKEHOLDER_PIPELINE.md
-python3 execution/pipeline_runner.py --address "350 5th Ave" --zip "10118"
+# 4. Start the frontend (separate terminal)
+cd web && npm install && npm run dev
+# Open http://localhost:3000
 ```
 
 ---
 
 ## Environment Variables
 
-Create a `.env` file in the project root:
-
 ```env
-# Model 2 — required
-EXA_API_KEY=your_key_here
-ANTHROPIC_API_KEY=your_key_here
-HUNTER_API_KEY=your_key_here
+# ── AI (required) ──────────────────────────────
+ANTHROPIC_API_KEY=
 
-# Model 1 — required for full stakeholder pipeline
-SMARTY_AUTH_ID=your_key_here
-SMARTY_AUTH_TOKEN=your_key_here
-SHOVELS_API_KEY=your_key_here
-ATTOM_API_KEY=your_key_here
-OPENCORPORATES_API_KEY=your_key_here
-APOLLO_API_KEY=your_key_here
-GOOGLE_SHEET_ID=your_sheet_id_here
+# ── Property Data ──────────────────────────────
+REGRID_API_KEY=           # Nationwide parcel ownership (primary)
+# NYC PLUTO + ACRIS: free, used automatically for NYC — no key needed
 
-# Optional
-APIFY_API_KEY=your_key_here
+# ── Contact Enrichment ─────────────────────────
+APOLLO_API_KEY=           # Needs Scale plan or API add-on for programmatic access
+HUNTER_API_KEY=           # Email fallback (active on free tier)
+APIFY_API_KEY=            # LinkedIn scraping (optional)
+
+# ── Web Search ─────────────────────────────────
+EXA_API_KEY=              # Required for leadership discovery
+GOOGLE_CSE_API_KEY=       # Google search fallback (optional)
+GOOGLE_CSE_ID=            # Google search fallback (optional)
+
+# ── Google Sheets Output (batch mode) ──────────
+GOOGLE_SHEET_ID=          # Sheet ID from the URL
+GOOGLE_SERVICE_ACCOUNT_FILE=  # Path to service account JSON key
+
+# ── Pipeline Settings ──────────────────────────
 ENRICH_PHONE_ROLES=Developer,GC
 ```
 
 ---
 
-## Data Processed
+## Google Sheets Setup (for Batch Mode)
 
-As of April 2026, the pipeline has processed **20 addresses** across 4 Queens neighborhoods:
+1. Go to [Google Cloud Console](https://console.cloud.google.com) → IAM → Service Accounts → Create
+2. Grant it **Editor** access to your Google Sheet
+3. Download the JSON key file
+4. Set `GOOGLE_SERVICE_ACCOUNT_FILE=/path/to/key.json` in `.env`
+5. Share your Google Sheet with the service account email address
 
-| Neighborhood | Addresses |
-|---|---|
-| Long Island City | 5 |
-| Astoria | 3 |
-| Sunnyside | 4 |
-| Woodside | 4 |
-| Other (Manhattan test) | 4 |
-
-Combined output: **81 stakeholders** identified across all addresses.
+If not configured, batch mode still works — results just won't push to Sheets.
 
 ---
 
-## Known Limitations
+## Apollo API Note
 
-- **Shell LLCs** with no public leadership (7 of 20 addresses returned NOT FOUND)
-- **NYC DOB permit API** times out occasionally — manual lookup fallback documented
-- **Hunter.io** monthly credit limit can exhaust on large batches (pipeline continues without email)
-- **LinkedIn URLs** are flagged `VERIFY_LINKEDIN` as some profiles are approximate matches
+Apollo's `people/match` and `mixed_people/search` endpoints (used for contact enrichment) require a **Scale plan or API add-on** — the Professional plan includes UI credits but not programmatic API access. Contact Apollo support to enable API access on your account.
 
-### Phase 2 Planned Improvements
-- Add NYC ACRIS (free deed/mortgage filings) to catch shell LLCs
-- Add OpenCorporates to Model 2 for LLC officer resolution
-- Add Apollo.io to Model 2 for higher email hit rate
+When Apollo is unavailable, the pipeline falls back to **Hunter.io** for emails and **Exa** for LinkedIn.
+
+---
+
+## Regrid Note
+
+The Regrid trial token covers a limited number of counties. For full nationwide coverage, upgrade to a paid Regrid plan. For **NYC addresses**, the pipeline automatically uses the free **NYC PLUTO + ACRIS** dataset regardless of Regrid status.
 
 ---
 
