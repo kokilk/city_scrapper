@@ -105,6 +105,184 @@ def _extract_links(html: str, base_url: str) -> list[str]:
 
 # ── Tool implementations ───────────────────────────────────────────────────────
 
+# ACRIS borough codes (different from PLUTO borough codes)
+_ACRIS_BOROUGH = {"MN": "1", "BX": "2", "BK": "3", "QN": "4", "SI": "5"}
+
+# ACRIS doc types that represent actual ownership transfers
+_DEED_TYPES = ("DEED", "DEEDO", "RPTT", "DEED, WT", "DEED, WC")
+
+
+# ── Regrid ─────────────────────────────────────────────────────────────────────
+
+def regrid_lookup(address: str, city: str, state: str, zip_code: str = "") -> dict:
+    """
+    Look up property ownership via Regrid API (nationwide, most current data).
+    Returns dict with keys: owner, owner2, address, city, state, zip, parcel_id, source.
+    Returns empty dict if key not set or property not found.
+
+    API docs: https://regrid.com/api
+    Endpoint: https://app.regrid.com/api/v2/parcels/address
+    """
+    api_key = os.getenv("REGRID_API_KEY", "").strip()
+    if not api_key:
+        return {}
+
+    try:
+        query = f"{address}, {city}, {state}"
+        if zip_code:
+            query += f" {zip_code}"
+        params = urllib.parse.urlencode({
+            "query": query,
+            "limit": "1",
+            "token": api_key,
+        })
+        url = f"https://app.regrid.com/api/v2/parcels/address?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode())
+
+        parcels = data.get("parcels", {}).get("features", [])
+        if not parcels:
+            return {}
+
+        props = parcels[0].get("properties", {}).get("fields", {})
+        owner = (props.get("owner") or props.get("ownername") or "").strip().title()
+        if not owner:
+            return {}
+
+        return {
+            "owner":     owner,
+            "owner2":    (props.get("owner2") or "").strip().title(),
+            "address":   props.get("address", ""),
+            "city":      props.get("scity", city),
+            "state":     props.get("state2", state),
+            "zip":       props.get("zip", zip_code),
+            "parcel_id": props.get("parcelnumb", ""),
+            "source":    "Regrid",
+        }
+    except Exception:
+        return {}
+
+
+def acris_owner_by_address(address: str, city: str) -> str:
+    """
+    Look up current owner from ACRIS directly using street address — no PLUTO needed.
+    Useful when PLUTO has no record for the property.
+    Returns grantee (current owner) name, or empty string if not found.
+    """
+    city_upper = city.upper().strip()
+    borough_map = {
+        "MANHATTAN": "1", "NEW YORK": "1",
+        "BRONX": "2", "THE BRONX": "2",
+        "BROOKLYN": "3",
+        "QUEENS": "4",
+        "STATEN ISLAND": "5",
+    }
+    known_boro = borough_map.get(city_upper, "")
+    # When city is a neighborhood name (Astoria, Long Island City, Flushing, Harlem, etc.)
+    # we don't know the borough — try all 5 sequentially
+    boros_to_try = [known_boro] if known_boro else ["4", "3", "1", "2", "5"]
+
+    addr_upper = address.strip().upper()
+    m = re.match(r"^(\d[\d\-]*)\s+(.+)$", addr_upper)
+    house = m.group(1) if m else ""
+    street = m.group(2) if m else addr_upper
+
+    # Normalise street suffix e.g. "36TH STREET" → "36 ST", "36TH DRIVE" → "36 DR"
+    street_clean = re.sub(
+        r"\b(STREET|AVENUE|DRIVE|BOULEVARD|PLACE|ROAD|LANE|COURT)\b",
+        lambda x: {"STREET": "ST", "AVENUE": "AVE", "DRIVE": "DR", "BOULEVARD": "BLVD",
+                   "PLACE": "PL", "ROAD": "RD", "LANE": "LN", "COURT": "CT"}[x.group()],
+        street,
+    )
+    # Remove ordinal suffixes: "36TH" → "36"
+    street_clean = re.sub(r"(\d+)(?:ST|ND|RD|TH)\b", r"\1", street_clean).strip()
+
+    pluto_boro_map = {"1": "MN", "2": "BX", "3": "BK", "4": "QN", "5": "SI"}
+
+    for boro in boros_to_try:
+        try:
+            # Step 1 — query ACRIS legals by address to get block/lot
+            where = f"borough = '{boro}' AND upper(street_name) like '%{street_clean}%'"
+            if house:
+                where += f" AND (street_number = '{house}' OR street_number like '{house}-%')"
+            params = urllib.parse.urlencode({"$where": where, "$limit": "10"})
+            legals = _get(f"https://data.cityofnewyork.us/resource/8h5j-fqxa.json?{params}")
+            if not isinstance(legals, list) or not legals:
+                continue
+
+            # Use the block/lot from first result, then call acris_current_owner
+            r0 = legals[0]
+            pluto_boro = pluto_boro_map.get(boro, "")
+            result = acris_current_owner(pluto_boro, r0.get("block", ""), r0.get("lot", ""))
+            if result:
+                return result
+        except Exception:
+            continue
+
+    return ""
+
+
+def acris_current_owner(pluto_borough: str, block: str, lot: str) -> str:
+    """
+    Query NYC ACRIS deed records to find the MOST RECENT owner of a property.
+    More up-to-date than PLUTO — reflects recent deed transfers.
+
+    Args:
+        pluto_borough: PLUTO borough code e.g. 'QN', 'MN', 'BK', 'BX', 'SI'
+        block: block number from PLUTO
+        lot: lot number from PLUTO
+
+    Returns: grantee (current owner) name, or empty string if not found
+    """
+    acris_boro = _ACRIS_BOROUGH.get(pluto_borough.upper(), "")
+    if not acris_boro or not block or not lot:
+        return ""
+
+    try:
+        # Step 1 — get all document IDs for this block/lot from ACRIS Legals
+        params = urllib.parse.urlencode({
+            "$where": f"borough = '{acris_boro}' AND block = '{block}' AND lot = '{lot}'",
+            "$limit": "50",
+        })
+        legals = _get(f"https://data.cityofnewyork.us/resource/8h5j-fqxa.json?{params}")
+        if not isinstance(legals, list) or not legals:
+            return ""
+
+        doc_ids = list(dict.fromkeys(l["document_id"] for l in legals if "document_id" in l))
+        if not doc_ids:
+            return ""
+
+        # Step 2 — query ACRIS Master for DEED-type documents among those IDs
+        id_clause = ",".join(f"'{d}'" for d in doc_ids[:30])
+        type_clause = ",".join(f"'{t}'" for t in _DEED_TYPES)
+        params2 = urllib.parse.urlencode({
+            "$where": f"document_id in ({id_clause}) AND doc_type in ({type_clause})",
+            "$limit": "10",
+            "$order": "recorded_datetime DESC",
+        })
+        masters = _get(f"https://data.cityofnewyork.us/resource/bnx9-e6tj.json?{params2}")
+        if not isinstance(masters, list) or not masters:
+            return ""
+
+        # Step 3 — get parties for the most recent deed
+        latest_doc_id = masters[0]["document_id"]
+        params3 = urllib.parse.urlencode({
+            "$where": f"document_id = '{latest_doc_id}' AND party_type = '2'",
+            "$limit": "5",
+        })
+        parties = _get(f"https://data.cityofnewyork.us/resource/636b-3b5g.json?{params3}")
+        if not isinstance(parties, list) or not parties:
+            return ""
+
+        # Grantee (party_type=2) is the buyer / current owner
+        grantee = parties[0].get("name", "").strip().title()
+        return grantee
+
+    except Exception:
+        return ""
+
+
 def lookup_owner_company(address: str, city: str) -> dict:
     """
     Look up property owner from NYC PLUTO dataset.
@@ -307,6 +485,37 @@ def _name_matches_url(name: str, url: str) -> bool:
     return first_ok and last_ok
 
 
+def _apollo_headers() -> dict:
+    api_key = os.getenv("APOLLO_API_KEY", "")
+    return {
+        "Content-Type": "application/json",
+        "X-Api-Key": api_key,
+        "Cache-Control": "no-cache",
+    }
+
+
+def _apollo_person_from_raw(person: dict, name: str, company: str) -> dict:
+    phones = person.get("phone_numbers", []) or []
+    mobile = next((p["raw_number"] for p in phones if p.get("type") == "mobile"), "")
+    direct = next((p["raw_number"] for p in phones if p.get("type") in ("direct", "work")), "")
+    any_phone = mobile or direct or (phones[0]["raw_number"] if phones else "")
+    linkedin_raw = person.get("linkedin_url", "") or ""
+    linkedin_url = _normalize_linkedin_url(linkedin_raw) if linkedin_raw else ""
+    return {
+        "found": True,
+        "name": person.get("name", name),
+        "title": person.get("title", ""),
+        "company": person.get("organization_name", company),
+        "email": person.get("email", ""),
+        "phone_mobile": mobile,
+        "phone_direct": direct,
+        "phone": any_phone,
+        "linkedin_url": linkedin_url,
+        "location": person.get("city", "") + (", " + person.get("state", "") if person.get("state") else ""),
+        "source": "Apollo",
+    }
+
+
 def enrich_with_apollo(name: str, company: str) -> dict:
     """
     Enrich a person using Apollo.io — returns email, phone, and verified LinkedIn URL.
@@ -321,32 +530,28 @@ def enrich_with_apollo(name: str, company: str) -> dict:
     first_name = parts[0] if parts else ""
     last_name = parts[-1] if len(parts) > 1 else ""
 
-    payload = {
-        "api_key": api_key,
-        "first_name": first_name,
-        "last_name": last_name,
-        "organization_name": company,
-    }
+    headers = _apollo_headers()
 
     data = _post(
         "https://api.apollo.io/v1/people/match",
-        {"Content-Type": "application/json"},
-        payload,
+        headers,
+        {
+            "first_name": first_name,
+            "last_name": last_name,
+            "organization_name": company,
+        },
         timeout=20,
     )
 
     if "error" in data or not data.get("person"):
-        # Fallback: try people search
-        search_payload = {
-            "api_key": api_key,
-            "q_keywords": f"{name} {company}",
-            "page": 1,
-            "per_page": 1,
-        }
         data2 = _post(
             "https://api.apollo.io/v1/mixed_people/search",
-            {"Content-Type": "application/json"},
-            search_payload,
+            headers,
+            {
+                "q_keywords": f"{name} {company}",
+                "page": 1,
+                "per_page": 1,
+            },
             timeout=20,
         )
         people = data2.get("people", [])
@@ -358,28 +563,40 @@ def enrich_with_apollo(name: str, company: str) -> dict:
     else:
         person = data["person"]
 
-    # Extract phone numbers
-    phones = person.get("phone_numbers", []) or []
-    mobile = next((p["raw_number"] for p in phones if p.get("type") == "mobile"), "")
-    direct = next((p["raw_number"] for p in phones if p.get("type") in ("direct", "work")), "")
-    any_phone = mobile or direct or (phones[0]["raw_number"] if phones else "")
+    return _apollo_person_from_raw(person, name, company)
 
-    linkedin_raw = person.get("linkedin_url", "") or ""
-    linkedin_url = _normalize_linkedin_url(linkedin_raw) if linkedin_raw else ""
 
-    return {
-        "found": True,
-        "name": person.get("name", name),
-        "title": person.get("title", ""),
-        "company": person.get("organization_name", company),
-        "email": person.get("email", ""),
-        "phone_mobile": mobile,
-        "phone_direct": direct,
-        "phone": any_phone,
-        "linkedin_url": linkedin_url,
-        "location": person.get("city", "") + (", " + person.get("state", "") if person.get("state") else ""),
-        "source": "Apollo",
-    }
+def apollo_search_by_org(company: str, max_people: int = 15) -> list[dict]:
+    """
+    Search Apollo for the top leadership at a company by organization name.
+    Returns up to max_people people with name, title, email, phone, linkedin.
+    """
+    api_key = os.getenv("APOLLO_API_KEY", "")
+    if not api_key:
+        return []
+
+    EXEC_TITLES = [
+        "CEO", "President", "Founder", "Co-Founder", "Chairman",
+        "CFO", "COO", "CIO", "CTO", "Managing Director",
+        "Managing Partner", "Principal", "Vice President", "Director",
+        "Executive Vice President", "Senior Vice President",
+    ]
+
+    headers = _apollo_headers()
+    data = _post(
+        "https://api.apollo.io/v1/mixed_people/search",
+        headers,
+        {
+            "q_organization_name": company,
+            "person_titles": EXEC_TITLES,
+            "page": 1,
+            "per_page": max_people,
+        },
+        timeout=25,
+    )
+
+    raw_people = data.get("people", [])
+    return [_apollo_person_from_raw(p, p.get("name", ""), company) for p in raw_people]
 
 
 def find_linkedin_url(name: str, company: str) -> dict:
@@ -664,6 +881,7 @@ TOOL_DEFINITIONS = [
 
 TOOL_MAP = {
     "enrich_with_apollo": enrich_with_apollo,
+    "apollo_search_by_org": apollo_search_by_org,
     "lookup_owner_company": lookup_owner_company,
     "search_web": search_web,
     "fetch_webpage": fetch_webpage,

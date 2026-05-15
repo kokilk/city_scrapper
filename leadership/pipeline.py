@@ -36,11 +36,20 @@ from leadership.tools import (
     fetch_webpage,
     find_linkedin_url,
     enrich_with_apollo,
+    apollo_search_by_org,
     apify_linkedin_scrape,
     find_email,
+    acris_current_owner,
+    acris_owner_by_address,
+    regrid_lookup,
     _normalize_linkedin_url,
     _get,
     _UA,
+)
+from leadership.validation import (
+    validate_company,
+    validate_people_batch,
+    validate_emails_batch,
 )
 import urllib.parse
 
@@ -96,8 +105,8 @@ def _is_skip_domain(url: str) -> bool:
 
 # ── Step 1: Find raw building owner ──────────────────────────────────────────
 
-def _pluto_lookup(address: str, city: str, zip_code: str = "") -> str:
-    """Try NYC PLUTO. Returns owner name or empty string."""
+def _pluto_lookup(address: str, city: str, zip_code: str = "") -> tuple[str, str, str, str]:
+    """Try NYC PLUTO. Returns (owner_name, borough_code, block, lot)."""
     city_upper = city.upper().strip()
     borough_map = {
         "MANHATTAN": "MN", "NEW YORK": "MN", "BROOKLYN": "BK",
@@ -132,15 +141,18 @@ def _pluto_lookup(address: str, city: str, zip_code: str = "") -> str:
         if house and results:
             matched = [r for r in results if r.get("address", "").startswith(house)]
             if matched:
-                return matched[0].get("ownername", "")
+                r0 = matched[0]
+                return r0.get("ownername", ""), borough, r0.get("block", ""), r0.get("lot", "")
             if len(results) == 1:
-                return results[0].get("ownername", "")
+                r0 = results[0]
+                return r0.get("ownername", ""), borough, r0.get("block", ""), r0.get("lot", "")
             results = []
 
         if results:
-            return results[0].get("ownername", "")
+            r0 = results[0]
+            return r0.get("ownername", ""), borough, r0.get("block", ""), r0.get("lot", "")
 
-    return ""
+    return "", "", "", ""
 
 
 def _dob_lookup(address: str, city: str) -> str:
@@ -287,22 +299,27 @@ def _resolve_llc_to_company(llc_name: str, address: str, city: str, state: str) 
     if len(base) < 3:
         base = llc_name  # couldn't simplify
 
-    # Search for the operating company — try both quoted and unquoted to handle truncated names
-    snippets = []
-    queries = [
-        f'"{base}" real estate {city} company developer investor',
-        f'"{llc_name}" {address} {city} owner developer operator',
-        # Unquoted fallback handles truncated DOB names
-        f'{base} real estate {city} company developer',
-        f'{address} {city} building owner developer company',
-    ]
-    for q in queries:
-        r = search_web(q, 5)
-        for item in r.get("results", []):
-            if not _is_skip_domain(item.get("url", "")):
-                snippets.append(item.get("snippet", "")[:300])
-        if snippets:
-            break  # stop once we have content
+    # Step 1: run the address-specific query first — most authoritative signal
+    address_snippets = []
+    r0 = search_web(f'"{address}" {state} owner acquired developer', 6)
+    for item in r0.get("results", []):
+        if not _is_skip_domain(item.get("url", "")):
+            address_snippets.append(item.get("snippet", "")[:300])
+
+    # If we got address-specific results, use ONLY those — avoids mixing with unrelated company data
+    if address_snippets:
+        snippets = address_snippets
+    else:
+        # Fallback: broader queries
+        snippets = []
+        for q in [
+            f'"{base}" real estate {state} company developer investor',
+            f'"{llc_name}" owner developer operator',
+        ]:
+            r = search_web(q, 5)
+            for item in r.get("results", []):
+                if not _is_skip_domain(item.get("url", "")):
+                    snippets.append(item.get("snippet", "")[:300])
 
     if not snippets:
         return base
@@ -331,30 +348,57 @@ def _resolve_llc_to_company(llc_name: str, address: str, city: str, state: str) 
     return result
 
 
-def find_building_owner(address: str, city: str, state: str, zip_code: str = "") -> tuple[str, str]:
+def find_building_owner(address: str, city: str, state: str, zip_code: str = "") -> tuple[str, str, str]:
     """
     Find the company that owns a building.
-    Returns (raw_entity_name, operating_company_name).
-    Sources:
-      1. NYC PLUTO (tax/ownership records — best for residential)
-      2. NYC DOB permits (building permits — best for large commercial)
-      3. Exa web search (fallback when both city databases miss)
+    Returns (raw_entity_name, operating_company_name, source).
+
+    Lookup order (most current → fallback):
+      1. Regrid       — nationwide, most up-to-date deed data (when key set)
+      2. NYC ACRIS    — real-time deed recordings (NYC only, via PLUTO block/lot)
+      3. NYC PLUTO    — tax roll ownership (NYC only, may lag months)
+      4. ACRIS direct — by street address when PLUTO has no record
+      5. NYC DOB      — building permit applicant/owner
+      6. Web search   — last resort
     """
-    # 1. PLUTO
-    raw = _pluto_lookup(address, city, zip_code)
-    if raw:
+    # 1. Regrid — try first regardless of city/state (nationwide, most current)
+    regrid = regrid_lookup(address, city, state, zip_code)
+    if regrid.get("owner"):
+        raw = regrid["owner"]
         if _is_property_llc(raw):
             operating = _resolve_llc_to_company(raw, address, city, state)
         else:
             operating = raw
-        return raw, operating
+        return raw, operating, "Regrid"
 
-    # 2. DOB permits (catches large commercial buildings absent from PLUTO)
+    # 2. PLUTO — get block/lot, then check ACRIS for most recent deed
+    pluto_raw, pluto_borough, block, lot = _pluto_lookup(address, city, zip_code)
+
+    if pluto_raw:
+        # Prefer ACRIS when available — it reflects actual recorded deed transfers
+        acris_raw = acris_current_owner(pluto_borough, block, lot)
+        raw = acris_raw if acris_raw else pluto_raw
+        source = "NYC ACRIS" if acris_raw else "NYC PLUTO"
+
+        if _is_property_llc(raw):
+            operating = _resolve_llc_to_company(raw, address, city, state)
+        else:
+            operating = raw
+        return raw, operating, source
+
+    # 3. ACRIS by address — when PLUTO has no record, query ACRIS directly
+    acris_raw = acris_owner_by_address(address, city)
+    if acris_raw:
+        if _is_property_llc(acris_raw):
+            operating = _resolve_llc_to_company(acris_raw, address, city, state)
+        else:
+            operating = acris_raw
+        return acris_raw, operating, "NYC ACRIS"
+
+    # 4. DOB permits
     raw = _dob_lookup(address, city)
     if raw:
         operating = _resolve_llc_to_company(raw, address, city, state)
-        # DOB truncates names at ~30 chars — if the resolved name looks unchanged/short,
-        # fall back to an address-based web search to get the real company name
         looks_truncated = (
             operating.upper() == raw.upper()
             and len(operating) < 15
@@ -364,11 +408,11 @@ def find_building_owner(address: str, city: str, state: str, zip_code: str = "")
             web = _web_owner_lookup(address, city, state)
             if web:
                 operating = web
-        return raw, operating
+        return raw, operating, "NYC DOB"
 
-    # 3. Web search fallback
+    # 5. Web search fallback
     raw = _web_owner_lookup(address, city, state)
-    return raw, raw
+    return raw, raw, "Web Search"
 
 
 # ── Step 2: Find company's official website ───────────────────────────────────
@@ -603,14 +647,23 @@ def _enrich_one(person: dict, company: str, domain: str) -> dict:
     Apollo is the primary source (email + phone + verified LinkedIn in one call).
     Exa LinkedIn search and Hunter run in parallel as fallbacks.
     """
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        apollo_f = ex.submit(enrich_with_apollo, person["name"], company)
-        li_f = ex.submit(find_linkedin_url, person["name"], company)
-        em_f = ex.submit(find_email, person["name"], domain) if domain else None
+    prefetched: dict = person.pop("_apollo_prefetched", None) or {}
 
-        apollo_r = apollo_f.result()
-        li_r = li_f.result()
-        em_r = em_f.result() if em_f else {}
+    if prefetched and prefetched.get("found"):
+        apollo_r = prefetched
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            li_f = ex.submit(find_linkedin_url, person["name"], company)
+            em_f = ex.submit(find_email, person["name"], domain) if domain else None
+            li_r = li_f.result()
+            em_r = em_f.result() if em_f else {}
+    else:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            apollo_f = ex.submit(enrich_with_apollo, person["name"], company)
+            li_f = ex.submit(find_linkedin_url, person["name"], company)
+            em_f = ex.submit(find_email, person["name"], domain) if domain else None
+            apollo_r = apollo_f.result()
+            li_r = li_f.result()
+            em_r = em_f.result() if em_f else {}
 
     apollo_found = apollo_r.get("found", False)
 
@@ -623,12 +676,17 @@ def _enrich_one(person: dict, company: str, domain: str) -> dict:
 
     # Email: prefer Apollo over Hunter
     email = ""
+    email_source = ""
     if apollo_found and apollo_r.get("email"):
         email = apollo_r["email"]
+        email_source = "Apollo"
     elif em_r.get("email"):
         email = em_r["email"]
+        email_source = "Hunter"
     if not email:
         email = _web_search_email(person["name"], company)
+        if email:
+            email_source = "Web Search"
 
     # Phone: prefer Apollo over web search
     phone = ""
@@ -637,11 +695,22 @@ def _enrich_one(person: dict, company: str, domain: str) -> dict:
     if not phone:
         phone = _web_search_phone(person["name"], company)
 
+    # LinkedIn source
+    li_source = ""
+    if li_url:
+        li_source = "Apollo" if (apollo_found and apollo_r.get("linkedin_url")) else "Exa"
+
+    contact_source = " | ".join(filter(None, [
+        f"Email: {email_source}" if email_source else "",
+        f"LinkedIn: {li_source}" if li_source else "",
+    ])) or "Web Search"
+
     return {
         **person,
         "linkedin_url": li_url,
         "email": email,
         "phone": phone,
+        "contact_source": contact_source,
     }
 
 
@@ -707,7 +776,7 @@ def run_pipeline(
 
     # ── Step 1: Owner lookup (PLUTO → DOB → Exa) — one attempt each ──────────
     log("Step 1/4 — Building owner (NYC open data)...")
-    raw_entity, company = find_building_owner(address, city, state, zip_code)
+    raw_entity, company, owner_source = find_building_owner(address, city, state, zip_code)
 
     if not raw_entity:
         return not_found("building owner not found in PLUTO / DOB / Exa")
@@ -721,6 +790,11 @@ def run_pipeline(
         log(f"  Registered entity: {raw_entity}")
         log(f"  Operating company: {company}")
 
+    # ── Checkpoint 1: Validate company from 2 independent sources ────────────
+    log(f"  Validating company: {company}...")
+    company_validation = validate_company(company, address, city, state)
+    log(f"  Company confidence: {company_validation['confidence']} ({company_validation['sources_found']}/2 sources) — {company_validation['validation_note']}")
+
     # Strip legal suffixes for search queries
     company_search = re.sub(
         r"\s*\b(LLC|INC|CORP|LP|LTD|HOLDINGS?|REALTY|GROUP|PARTNERS?|CAPITAL|ASSOCIATES?|TRUST)\b.*$",
@@ -733,19 +807,41 @@ def run_pipeline(
     if not website and company_search != company:
         website = find_company_website(company_search)
 
+    # Sanity check — reject websites whose domain has zero overlap with company name
+    if website:
+        domain_m = re.search(r"https?://(?:www\.)?([^/]+)", website)
+        domain_check = domain_m.group(1).lower().replace("-", "").replace(".", "") if domain_m else ""
+        # Only check distinctive words — strip generic real estate terms
+        _generic = {"real", "estate", "realty", "properties", "property", "group",
+                    "capital", "partners", "healthcare", "medical", "services",
+                    "management", "investment", "investments", "holdings", "ventures"}
+        company_words = [
+            w.lower() for w in re.split(r"[\s\-]+", company_search)
+            if len(w) >= 4 and w.lower() not in _generic
+        ]
+        domain_matches = bool(company_words) and any(w[:5] in domain_check for w in company_words)
+        if not domain_matches:
+            website = ""  # domain is unrelated — discard it
+
     domain_m = re.search(r"https?://(?:www\.)?([^/]+)", website) if website else None
     domain = domain_m.group(1) if domain_m else ""
-    log(f"  Website: {website or 'not found — Exa-only mode'}")
+    log(f"  Website: {website or 'not found — using web search only'}")
 
-    # ── Step 3: Gather all text in ONE pass (scrape + 5 Exa queries) ─────────
+    # ── Step 3: Gather all text + Apollo org search in parallel ──────────────
     log("Step 3/4 — Gathering leadership data...")
 
-    # 3a. Scrape website (one fetch, parallel subpages)
-    page_text = ""
-    linkedin_from_page: list[str] = []
-    if website:
-        page_text, linkedin_from_page = scrape_team_page(website)
-        log(f"  Website: {len(page_text)} chars scraped")
+    apollo_people_future = None
+    with ThreadPoolExecutor(max_workers=2) as gather_ex:
+        # 3a. Scrape website
+        page_text = ""
+        linkedin_from_page: list[str] = []
+
+        # 3b. Apollo org search — runs in background while we scrape + search Exa
+        apollo_people_future = gather_ex.submit(apollo_search_by_org, company, 15)
+
+        if website:
+            page_text, linkedin_from_page = scrape_team_page(website)
+            log(f"  Website: {len(page_text)} chars scraped")
 
     # Detect JS-rendered garbage (navigation menus instead of content)
     js_garbage = (
@@ -754,7 +850,17 @@ def run_pipeline(
         or page_text.count("CONTRAST") > 3
     )
 
-    # 3b. Exa search — exactly 5 queries, no retry
+    # Collect Apollo org results
+    apollo_org_people: list[dict] = []
+    if apollo_people_future:
+        try:
+            apollo_org_people = apollo_people_future.result() or []
+        except Exception:
+            apollo_org_people = []
+    if apollo_org_people:
+        log(f"  Apollo: {len(apollo_org_people)} people found at {company}")
+
+    # 3c. Exa search — exactly 5 queries, no retry
     exa_queries = [
         f'"{company}" CEO president founder chairman leadership executives',
         f'"{company}" managing director vice president CFO COO principal officer',
@@ -790,8 +896,50 @@ def run_pipeline(
     log("Step 4/4 — Extracting leaders + enriching contacts...")
     people = extract_leaders(combined_text, company, max_chars=16000)
 
+    # Build a lookup of Apollo org results by name for enrichment shortcut
+    apollo_org_by_name: dict[str, dict] = {}
+    for ap in apollo_org_people:
+        ap_name = ap.get("name", "").strip()
+        if ap_name:
+            apollo_org_by_name[ap_name.lower()] = ap
+
+    # Merge Apollo org people: add anyone not already in Claude's list
+    if apollo_org_people:
+        existing_names = {p["name"].lower() for p in people}
+        for ap in apollo_org_people:
+            ap_name = ap.get("name", "").strip()
+            if ap_name and ap_name.lower() not in existing_names:
+                people.append({
+                    "name": ap_name,
+                    "title": ap.get("title", ""),
+                    "_apollo_prefetched": ap,
+                })
+                existing_names.add(ap_name.lower())
+
     if not people:
-        return not_found(f"no leaders found for '{company}' — data may not be publicly available")
+        log(f"  No leaders found for '{company}' — returning company info only")
+        placeholder = [{
+            "rank": 1,
+            "full_name": "",
+            "title": "",
+            "company": company,
+            "email": "",
+            "phone": "",
+            "linkedin_url": "",
+            "confidence": "Low",
+            "property_address": full_address,
+            "owner_entity": raw_entity,
+            "data_source": f"Owner: {owner_source} | Contacts: —",
+            "person_verified": False,
+            "person_sources": 0,
+            "person_validation_note": "No leadership data publicly available",
+            "email_valid": False,
+            "email_deliverable": None,
+            "email_check_note": "—",
+            "company_confidence": company_validation["confidence"],
+            "company_validation_note": company_validation["validation_note"],
+        }]
+        return placeholder
 
     log(f"  {len(people)} people: {', '.join(p['name'] for p in people[:4])}{'...' if len(people) > 4 else ''}")
 
@@ -814,6 +962,14 @@ def run_pipeline(
             em_m = r.get("email") or "—"
             log(f"  {r['name']} | {em_m} | {li_m}")
 
+    # ── Checkpoint 2: Validate people (first 15, parallel) ───────────────────
+    log("  Validating people...")
+    enriched = validate_people_batch(enriched, company)
+
+    # ── Checkpoint 3: Validate emails (parallel) ──────────────────────────────
+    log("  Validating emails...")
+    enriched = validate_emails_batch(enriched)
+
     # ── Build final result list ────────────────────────────────────────────────
     leaders: list[dict] = []
     for i, p in enumerate(enriched, 1):
@@ -822,7 +978,22 @@ def run_pipeline(
         phone = p.get("phone") or ""
         has_li = bool(li_url)
         has_em = bool(email)
-        conf = "High" if (has_li and has_em) else ("Medium" if (has_li or has_em) else "Low")
+        email_ok = p.get("email_valid", False)
+
+        # Confidence now factors in validation
+        person_verified = p.get("verified", False)
+        if has_li and has_em and email_ok and person_verified:
+            conf = "High"
+        elif (has_li or has_em) and person_verified:
+            conf = "Medium"
+        elif has_li or has_em:
+            conf = "Low"
+        else:
+            conf = "Unverified"
+
+        contact_source = p.get("contact_source", "—")
+        data_source = f"Owner: {owner_source} | Contacts: {contact_source}"
+
         leaders.append({
             "rank": i,
             "full_name": p["name"],
@@ -834,6 +1005,16 @@ def run_pipeline(
             "confidence": conf,
             "property_address": full_address,
             "owner_entity": raw_entity,
+            "data_source": data_source,
+            # Validation fields
+            "person_verified":        p.get("verified", False),
+            "person_sources":         p.get("person_sources", 0),
+            "person_validation_note": p.get("person_validation_note", "—"),
+            "email_valid":            p.get("email_valid", False),
+            "email_deliverable":      p.get("email_deliverable"),
+            "email_check_note":       p.get("email_check_note", "—"),
+            "company_confidence":     company_validation["confidence"],
+            "company_validation_note": company_validation["validation_note"],
         })
 
     # ── Save + clean up old files for this address ────────────────────────────
@@ -842,7 +1023,9 @@ def run_pipeline(
     addr_slug = re.sub(r"[^A-Za-z0-9]", "_", full_address)[:40]
 
     fields = ["rank", "full_name", "title", "company", "email", "phone",
-              "linkedin_url", "confidence", "property_address", "owner_entity"]
+              "linkedin_url", "confidence", "property_address", "owner_entity", "data_source",
+              "person_verified", "person_sources", "person_validation_note",
+              "email_valid", "email_check_note", "company_confidence", "company_validation_note"]
 
     csv_path = OUTPUT_DIR / f"{addr_slug}_{timestamp}.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -935,7 +1118,7 @@ def run_addresses(addresses: list[str], append: bool = False) -> None:
     t_start = _time.time()
 
     fields = ["rank", "full_name", "title", "company", "email", "phone",
-              "linkedin_url", "confidence", "property_address", "owner_entity"]
+              "linkedin_url", "confidence", "property_address", "owner_entity", "data_source"]
 
     # Load existing results if appending
     existing_leaders: list[dict] = []

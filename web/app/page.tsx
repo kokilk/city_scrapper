@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -14,6 +14,7 @@ export interface DisplayPerson {
   linkedin_url: string;
   confidence: string;
   property_address: string;
+  data_source: string;
 }
 
 type StepStatus = "pending" | "running" | "done" | "error";
@@ -113,11 +114,13 @@ function PersonCard({ p, i }: { p: DisplayPerson; i: number }) {
       <div className="flex items-center gap-3 mb-3">
         {/* Avatar */}
         <div className="w-9 h-9 rounded-full bg-blue-50 border border-blue-100 flex items-center justify-center text-blue-600 font-semibold text-sm flex-shrink-0">
-          {p.full_name.split(" ").map(w => w[0]).slice(0, 2).join("")}
+          {p.full_name ? p.full_name.split(" ").map((w: string) => w[0]).slice(0, 2).join("") : "?"}
         </div>
         <div className="min-w-0">
-          <div className="font-semibold text-ink text-sm leading-5 truncate">{p.full_name}</div>
-          <div className="text-xs text-ink2 truncate">{p.title}</div>
+          <div className="font-semibold text-ink text-sm leading-5 truncate">
+            {p.full_name || <span className="text-ink3 italic">No leadership data found</span>}
+          </div>
+          <div className="text-xs text-ink2 truncate">{p.title || "Company owner identified — no public contacts available"}</div>
         </div>
       </div>
 
@@ -158,13 +161,211 @@ function PersonCard({ p, i }: { p: DisplayPerson; i: number }) {
           <span className="text-[11px] text-ink3">No contact info found</span>
         )}
       </div>
+      {p.data_source && (
+        <div className="mt-2 pt-2 border-t border-stone-100">
+          <span className="inline-block text-[10px] font-medium bg-stone-100 text-stone-500 rounded px-2 py-0.5 tracking-wide">
+            {p.data_source}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
 
+// ── Batch tab ───────────────────────────────────────────────────────────────
+
+type BatchItemStatus = "queued" | "processing" | "retrying" | "done" | "retried" | "failed";
+
+interface BatchItem {
+  address: string;
+  status: BatchItemStatus;
+  count: number;
+  error: string;
+}
+
+interface BatchState {
+  completed: number;
+  total: number;
+  items: BatchItem[];
+  done: boolean;
+  sheet_id: string;
+}
+
+const STATUS_STYLES: Record<BatchItemStatus, string> = {
+  queued:     "bg-stone-100 text-stone-400",
+  processing: "bg-blue-50 text-blue-600",
+  retrying:   "bg-amber-50 text-amber-600",
+  done:       "bg-emerald-50 text-emerald-600",
+  retried:    "bg-amber-50 text-amber-700",
+  failed:     "bg-rose-50 text-rose-600",
+};
+
+function BatchTab() {
+  const [file, setFile]           = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [batchId, setBatchId]     = useState<string | null>(null);
+  const [state, setState]         = useState<BatchState | null>(null);
+  const [error, setError]         = useState("");
+  const fileRef                   = useRef<HTMLInputElement>(null);
+  const esRef                     = useRef<EventSource | null>(null);
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (f) setFile(f);
+  };
+
+  const handleUpload = async () => {
+    if (!file) return;
+    setUploading(true);
+    setError("");
+    setState(null);
+
+    const form = new FormData();
+    form.append("file", file);
+
+    try {
+      const res = await fetch(`${API_URL}/batch/upload`, { method: "POST", body: form });
+      const json = await res.json();
+      if (!res.ok) { setError(json.detail || "Upload failed"); return; }
+      setBatchId(json.batch_id);
+    } catch (e) {
+      setError("Upload failed — is the server running?");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!batchId) return;
+    if (esRef.current) esRef.current.close();
+
+    const es = new EventSource(`${API_URL}/batch/status/${batchId}`);
+    esRef.current = es;
+
+    es.addEventListener("progress", (e) => {
+      const data: BatchState = JSON.parse(e.data);
+      setState(data);
+      if (data.done) es.close();
+    });
+
+    es.onerror = () => es.close();
+    return () => es.close();
+  }, [batchId]);
+
+  const pct = state ? Math.round((state.completed / state.total) * 100) : 0;
+  const isRunning = !!batchId && !state?.done;
+
+  return (
+    <div className="space-y-5">
+
+      {/* Upload card */}
+      <div className="bg-surface border border-border rounded-2xl shadow-card p-5 space-y-4">
+        <div>
+          <label className="block text-xs font-medium text-ink2 mb-1.5">Excel file (.xlsx)</label>
+          <p className="text-[11px] text-ink3 mb-3">
+            First column = full address (e.g. "35-37 36th Street, Astoria, NY 11106"). First row can be a header — it will be skipped automatically.
+          </p>
+          <div
+            onClick={() => fileRef.current?.click()}
+            className="border-2 border-dashed border-border rounded-xl p-6 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50/30 transition-all"
+          >
+            <svg className="mx-auto mb-2" width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <path d="M12 4v12M8 8l4-4 4 4M4 20h16" stroke="#94A3B8" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            <p className="text-sm text-ink2">{file ? file.name : "Click to choose Excel file"}</p>
+            <p className="text-[11px] text-ink3 mt-1">{file ? `${(file.size / 1024).toFixed(1)} KB` : "Supports .xlsx"}</p>
+          </div>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls" onChange={handleFile} className="hidden" />
+        </div>
+
+        <button
+          onClick={handleUpload}
+          disabled={!file || uploading || isRunning}
+          className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-sm font-semibold transition-colors shadow-sm"
+        >
+          {uploading ? "Uploading…" : isRunning ? "Processing…" : "Start batch"}
+        </button>
+
+        {error && <p className="text-xs text-rose-600">{error}</p>}
+      </div>
+
+      {/* Progress */}
+      {state && (
+        <div className="bg-surface border border-border rounded-2xl shadow-card p-5 space-y-4 animate-fadeup">
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold text-ink">
+              {state.done ? "Batch complete" : "Processing batch…"}
+            </div>
+            <span className="text-xs font-mono text-ink3">{state.completed}/{state.total}</span>
+          </div>
+
+          {/* Progress bar */}
+          <div className="h-2 bg-s2 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-600 rounded-full transition-all duration-500"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+
+          {/* Google Sheet link */}
+          {state.done && state.sheet_id && (
+            <a
+              href={`https://docs.google.com/spreadsheets/d/${state.sheet_id}`}
+              target="_blank"
+              rel="noreferrer"
+              className="flex items-center gap-2 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-100 px-3 py-2 rounded-lg hover:bg-emerald-100 transition-colors"
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                <rect x="1" y="1" width="12" height="12" rx="2" stroke="#059669" strokeWidth="1.3"/>
+                <path d="M4 4h6M4 7h6M4 10h4" stroke="#059669" strokeWidth="1.3" strokeLinecap="round"/>
+              </svg>
+              View results in Google Sheets →
+            </a>
+          )}
+
+          {/* Address list */}
+          <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
+            {state.items.map((item, i) => (
+              <div key={i} className="flex items-center gap-3 py-1.5 border-b border-border last:border-0">
+                <span className="text-[10px] font-mono text-ink3 w-5 flex-shrink-0">{i + 1}</span>
+                <span className="flex-1 text-xs text-ink truncate">{item.address}</span>
+                <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full flex-shrink-0 ${STATUS_STYLES[item.status]}`}>
+                  {item.status === "done" || item.status === "retried"
+                    ? `${item.count} found`
+                    : item.status === "failed"
+                    ? "failed"
+                    : item.status}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {/* Stats summary when done */}
+          {state.done && (
+            <div className="flex gap-4 pt-2 border-t border-border">
+              {(["done", "retried", "failed"] as BatchItemStatus[]).map(s => {
+                const n = state.items.filter(i => i.status === s).length;
+                if (!n) return null;
+                return (
+                  <div key={s} className="text-center">
+                    <div className={`text-lg font-bold ${s === "failed" ? "text-rose-600" : s === "retried" ? "text-amber-600" : "text-emerald-600"}`}>{n}</div>
+                    <div className="text-[10px] text-ink3 capitalize">{s}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── Main page ───────────────────────────────────────────────────────────────
 
 export default function Home() {
+  const [tab, setTab]           = useState<"single" | "batch">("single");
   const [address, setAddress]   = useState("");
   const [model, setModel]       = useState<"2" | "1">("2");
   const [phase, setPhase]       = useState<Phase>("idle");
@@ -243,6 +444,7 @@ export default function Home() {
             linkedin_url: (r.linkedin_url as string) || "",
             confidence: (r.confidence as string) || (r.confidence_label as string) || "Low",
             property_address: (r.property_address as string) || "",
+            data_source: (r.data_source as string) || "",
           }));
           setCompany(normalised[0]?.company || "");
           setPeople(normalised);
@@ -284,9 +486,9 @@ export default function Home() {
 
   const downloadCSV = () => {
     if (!people.length) return;
-    const headers = ["rank","full_name","title","company","phone","email","linkedin_url","confidence","property_address"];
+    const headers = ["rank","full_name","title","company","phone","email","linkedin_url","confidence","property_address","data_source"];
     const rows = people.map(p =>
-      headers.map(h => `"${((p as Record<string, unknown>)[h] ?? "").toString().replace(/"/g, '""')}"`).join(",")
+      headers.map(h => `"${((p as unknown as Record<string, unknown>)[h] ?? "").toString().replace(/"/g, '""')}"`).join(",")
     );
     const csv = [headers.join(","), ...rows].join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
@@ -327,6 +529,27 @@ export default function Home() {
           <h1 className="text-2xl font-semibold text-ink tracking-tight">Find building leadership</h1>
           <p className="text-ink2 text-sm">Enter any property address to find the ownership company and its key contacts.</p>
         </div>
+
+        {/* ── Tab switcher ── */}
+        <div className="flex gap-1 bg-s2 border border-border p-1 rounded-xl w-fit">
+          {(["single", "batch"] as const).map(t => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                tab === t
+                  ? "bg-surface text-ink shadow-sm border border-border"
+                  : "text-ink3 hover:text-ink2"
+              }`}
+            >
+              {t === "single" ? "Single address" : "Batch upload"}
+            </button>
+          ))}
+        </div>
+
+        {tab === "batch" && <BatchTab />}
+
+        {tab === "single" && <>
 
         {/* ── Search card ── */}
         <div className="bg-surface border border-border rounded-2xl shadow-card p-5">
@@ -493,6 +716,8 @@ export default function Home() {
             </div>
           </div>
         )}
+
+        </>}
 
       </main>
 

@@ -9,11 +9,13 @@ import json
 import os
 import sys
 import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import AsyncGenerator
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -719,6 +721,168 @@ async def run_agent_stream(req: SearchRequest) -> AsyncGenerator[str, None]:
 async def search(req: SearchRequest):
     return StreamingResponse(
         run_agent_stream(req),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ── Batch processing ──────────────────────────────────────────────────────────
+
+# In-memory store: batch_id → state dict
+_batches: dict[str, dict] = {}
+_BATCH_SIZE = 10  # process this many addresses in parallel per wave
+
+
+def _parse_excel(file_bytes: bytes) -> list[str]:
+    """Extract addresses from first column of uploaded Excel file."""
+    import io
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    ws = wb.active
+    addresses = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i == 0:
+            # Skip header row if first cell looks like a label
+            val = str(row[0] or "").strip().lower()
+            if val in ("address", "addresses", "property", "location"):
+                continue
+        val = str(row[0] or "").strip() if row else ""
+        if val:
+            addresses.append(val)
+    wb.close()
+    return addresses
+
+
+def _process_one(address: str, batch_id: str, idx: int) -> dict:
+    """Run pipeline for one address, retry once on failure."""
+    from leadership.pipeline import run_pipeline, parse_full_address
+    from leadership.sheets import append_results
+
+    state = _batches[batch_id]
+    state["items"][idx]["status"] = "processing"
+
+    def _run():
+        street, city, state_abbr, zip_code = parse_full_address(address)
+        if not city:
+            city = "Unknown"
+        return run_pipeline(street, city, state_abbr, zip_code, verbose=False)
+
+    leaders = []
+    status = "done"
+    error_msg = ""
+
+    try:
+        leaders = _run()
+    except Exception as e:
+        # Retry once
+        state["items"][idx]["status"] = "retrying"
+        try:
+            leaders = _run()
+            status = "retried"
+        except Exception as e2:
+            status = "failed"
+            error_msg = str(e2)
+
+    state["items"][idx]["status"] = status
+    state["items"][idx]["error"] = error_msg
+    state["items"][idx]["count"] = len(leaders)
+    state["completed"] += 1
+
+    append_results(address, leaders, batch_id, status)
+    return {"address": address, "leaders": leaders, "status": status}
+
+
+def _run_batch(batch_id: str):
+    """Process all addresses in waves of BATCH_SIZE."""
+    state = _batches[batch_id]
+    addresses = state["addresses"]
+    total = len(addresses)
+
+    for wave_start in range(0, total, _BATCH_SIZE):
+        wave = addresses[wave_start: wave_start + _BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=_BATCH_SIZE) as ex:
+            futures = {
+                ex.submit(_process_one, addr, batch_id, wave_start + i): i
+                for i, addr in enumerate(wave)
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+    state["status"] = "done"
+
+
+@app.post("/batch/upload")
+async def batch_upload(file: UploadFile = File(...)):
+    """Accept an Excel file, parse addresses, start batch processing."""
+    if not file.filename or not file.filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="Please upload an Excel file (.xlsx)")
+
+    content = await file.read()
+    try:
+        addresses = _parse_excel(content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse Excel file: {e}")
+
+    if not addresses:
+        raise HTTPException(status_code=400, detail="No addresses found in the file")
+
+    batch_id = str(uuid.uuid4())[:8]
+    _batches[batch_id] = {
+        "status": "running",
+        "addresses": addresses,
+        "completed": 0,
+        "total": len(addresses),
+        "items": [
+            {"address": a, "status": "queued", "count": 0, "error": ""}
+            for a in addresses
+        ],
+    }
+
+    thread = threading.Thread(target=_run_batch, args=(batch_id,), daemon=True)
+    thread.start()
+
+    return {"batch_id": batch_id, "total": len(addresses)}
+
+
+@app.get("/batch/status/{batch_id}")
+async def batch_status(batch_id: str):
+    """SSE stream of batch progress."""
+    if batch_id not in _batches:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    async def stream() -> AsyncGenerator[str, None]:
+        from leadership.sheets import sheets_configured
+        last_completed = -1
+        while True:
+            state = _batches.get(batch_id)
+            if not state:
+                break
+
+            completed = state["completed"]
+            total = state["total"]
+            batch_done = state["status"] == "done"
+
+            if completed != last_completed or batch_done:
+                last_completed = completed
+                payload = {
+                    "completed": completed,
+                    "total": total,
+                    "items": state["items"],
+                    "done": batch_done,
+                    "sheet_id": os.getenv("GOOGLE_SHEET_ID", "") if sheets_configured() else "",
+                }
+                yield _sse("progress", payload)
+
+            if batch_done:
+                break
+
+            await asyncio.sleep(1.5)
+
+    return StreamingResponse(
+        stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
